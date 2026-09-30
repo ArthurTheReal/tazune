@@ -152,4 +152,53 @@ impl BytePacketBuffer {
         self.seek(resume_pos.unwrap_or(pos))?;
         Ok(result)
     }
+
+    fn write(&mut self, val: u8) -> Result<(), TazuneError> {
+        if self.pos >= 512 {
+            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
+        }
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<(), TazuneError> {
+        self.write(val)?;
+
+        Ok(())
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<(), TazuneError> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<(), TazuneError> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write(((val >> 0) & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<(), TazuneError> {
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 0x3f {
+                return Err(TazuneError::LabelTooLong { label_len: len });
+            }
+
+            self.write_u8(len as u8)?;
+            for b in label.as_bytes() {
+                self.write_u8(*b)?;
+            }
+        }
+
+        self.write_u8(0)?;
+
+        Ok(())
+    }
 }

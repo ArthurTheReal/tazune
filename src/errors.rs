@@ -16,5 +16,8 @@ pub enum TazuneError {
     InvalidLabelType {label_type: u8},
 
     #[error("query name is too long, max length is {max_name_len} but a name with length of {name_len} was encountered")]
-    QNameTooLong {max_name_len: usize, name_len: usize}
+    QNameTooLong {max_name_len: usize, name_len: usize},
+
+    #[error("label too long, a single label can be up to 63 characters long, but a label with length of {label_len} was encountered")]
+    LabelTooLong {label_len: usize}
 }
