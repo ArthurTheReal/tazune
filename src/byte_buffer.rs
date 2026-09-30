@@ -13,7 +13,7 @@ pub struct BytePacketBuffer {
 impl BytePacketBuffer {
     pub fn new(max_len: usize) -> BytePacketBuffer {
         BytePacketBuffer {
-            buf: vec![],
+            buf: Vec::from_iter(std::iter::repeat(0).take(max_len)),
             pos: 0,
             max_length: max_len,
         }
@@ -32,11 +32,11 @@ impl BytePacketBuffer {
     }
 
     pub fn seek(&mut self, pos: usize) -> Result<(), TazuneError> {
-        if pos > self.max_length || pos < 0 {
-            self.pos = pos;
-            return Ok(());
+        if pos > self.max_length {
+            return Err(TazuneError::IndexOutOfRange { range_start: 0, range_end: self.max_length });
         }
-        return Err(TazuneError::IndexOutOfRange { range_start: 0, range_end: self.max_length });
+        self.pos = pos;
+        return Ok(());
     }
 
     pub fn read(&mut self) -> Result<u8, TazuneError> {
