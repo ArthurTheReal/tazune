@@ -1,9 +1,13 @@
 use crate::errors::TazuneError;
 
+const MAX_LABEL_LEN: usize = 63;
+const MAX_NAME_LEN: usize = 255; // wire format, including length bytes and the root label
+const MAX_JUMPS: usize = 5;
+
 pub struct BytePacketBuffer {
     pub buf: Vec<u8>,
     pub pos: usize,
-    pub max_length: usize
+    pub max_length: usize,
 }
 
 impl BytePacketBuffer {
@@ -11,7 +15,7 @@ impl BytePacketBuffer {
         BytePacketBuffer {
             buf: vec![],
             pos: 0,
-            max_length: max_len
+            max_length: max_len,
         }
     }
 
@@ -23,7 +27,7 @@ impl BytePacketBuffer {
         if self.pos + steps >= self.max_length {
             return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
         }
-        self.pos+=steps;
+        self.pos += steps;
         Ok(())
     }
 
@@ -56,7 +60,7 @@ impl BytePacketBuffer {
         if start + len >= 512 {
             return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
         }
-        Ok(&self.buf[start..start + len as usize])
+        Ok(&self.buf[start..start + (len as usize)])
     }
 
     pub fn read_u16(&mut self) -> Result<u16, TazuneError> {
@@ -66,93 +70,86 @@ impl BytePacketBuffer {
     }
 
     pub fn read_u32(&mut self) -> Result<u32, TazuneError> {
-        let res = ((self.read()? as u32) << 24)
-            | ((self.read()? as u32) << 16)
-            | ((self.read()? as u32) << 8)
-            | ((self.read()? as u32) << 0);
+        let res =
+            ((self.read()? as u32) << 24) |
+            ((self.read()? as u32) << 16) |
+            ((self.read()? as u32) << 8) |
+            ((self.read()? as u32) << 0);
 
         Ok(res)
     }
 
-
     // Will take something like [3]www[6]google[3]com[0] and returns www.google.com.
     pub fn read_qname(&mut self) -> Result<String, TazuneError> {
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         let mut pos = self.pos();
 
-        // track whether or not we've jumped
-        let mut jumped = false;
-        let max_jumps = 5;
-        let mut jumps_performed = 0;
+        // Where the caller's cursor should end up: right after the first
+        // compression pointer, or after the terminating zero byte.
+        let mut resume_pos: Option<usize> = None;
+        let mut jumps = 0;
+        let mut wire_len = 1; // the terminating root label
 
-        // Our delimiter which we append for each label. Since we don't want a
-        // dot at the beginning of the domain name we'll leave it empty for now
-        // and set it to "." at the end of the first iteration.
-        let mut delim = "";
         loop {
-            // Dns Packets are untrusted data, so we need to be paranoid. Someone
-            // can craft a packet with a cycle in the jump instructions. This guards
-            // against such packets.
-            if jumps_performed > max_jumps {
-                return Err(TazuneError::MaxJumpsPerformed);
-            }
-
-            // At this point, we're always at the beginning of a label. Recall
-            // that labels start with a length byte.
+            // We're always at the start of a label here.
             let len = self.get(pos)?;
 
-            // If len has the two most significant bit are set, it represents a
-            // jump to some other offset in the packet:
-            if (len & 0xC0) == 0xC0 {
-                // Update the buffer position to a point past the current
-                // label. We don't need to touch it any further.
-                if !jumped {
-                    self.seek(pos + 2)?;
+            match len & 0xc0 {
+                // Compression pointer: 14-bit offset across two bytes.
+                0xc0 => {
+                    let b2 = self.get(pos + 1)?;
+                    resume_pos.get_or_insert(pos + 2);
+
+                    jumps += 1;
+                    if jumps > MAX_JUMPS {
+                        return Err(TazuneError::MaxJumpsPerformed);
+                    }
+
+                    pos = (((len & 0x3f) as usize) << 8) | (b2 as usize);
                 }
 
-                // Read another byte, calculate offset and perform the jump by
-                // updating our local position variable
-                let b2 = self.get(pos + 1)? as u16;
-                let offset = (((len as u16) ^ 0xC0) << 8) | b2;
-                pos = offset as usize;
+                // Ordinary label.
+                0x00 => {
+                    pos += 1;
+                    if len == 0 {
+                        break; // root label, name is complete
+                    }
 
-                // Indicate that a jump was performed.
-                jumped = true;
-                jumps_performed += 1;
+                    let len = len as usize; // already guaranteed <= 63 by the mask
+                    debug_assert!(len <= MAX_LABEL_LEN);
 
-                continue;
-            }
-            // The base scenario, where we're reading a single label and
-            // appending it to the output:
-            else {
-                // Move a single byte forward to move past the length byte.
-                pos += 1;
+                    wire_len += len + 1;
+                    if wire_len > MAX_NAME_LEN {
+                        return Err(TazuneError::QNameTooLong {max_name_len: MAX_NAME_LEN, name_len: wire_len });
+                    }
 
-                // Domain names are terminated by an empty label of length 0,
-                // so if the length is zero we're done.
-                if len == 0 {
-                    break;
+                    if !result.is_empty() {
+                        result.push('.');
+                    }
+
+                    for &b in self.get_range(pos, len)? {
+                        match b {
+                            // Escape so the output is unambiguous (RFC 1035 §5.1).
+                            b'.' | b'\\' => {
+                                result.push('\\');
+                                result.push(b as char);
+                            }
+                            0x21..=0x7e => result.push(b.to_ascii_lowercase() as char),
+                            _ => result.push_str(&format!("\\{:03}", b)),
+                        }
+                    }
+
+                    pos += len;
                 }
 
-                // Append the delimiter to our output buffer first.
-                result.push_str(delim);
-
-                // Extract the actual ASCII bytes for this label and append them
-                // to the output buffer.
-                let str_buffer = self.get_range(pos, len as usize)?;
-                result.push_str(&String::from_utf8_lossy(str_buffer).to_lowercase());
-
-                delim = ".";
-
-                // Move forward the full length of the label.
-                pos += len as usize;
+                // 0x40 / 0x80 label types are reserved.
+                _ => {
+                    return Err(TazuneError::InvalidLabelType { label_type: len & 0xc0 });
+                }
             }
         }
 
-        if !jumped {
-            self.seek(pos)?;
-        }
-
+        self.seek(resume_pos.unwrap_or(pos))?;
         Ok(result)
     }
 }

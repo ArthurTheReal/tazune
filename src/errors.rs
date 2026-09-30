@@ -12,5 +12,9 @@ pub enum TazuneError {
     #[error("maximum number of jumps performed during parsing the query name")]
     MaxJumpsPerformed,
 
-    
+    #[error("invalid lable type in query name section: {label_type}")]
+    InvalidLabelType {label_type: u8},
+
+    #[error("query name is too long, max length is {max_name_len} but a name with length of {name_len} was encountered")]
+    QNameTooLong {max_name_len: usize, name_len: usize}
 }
