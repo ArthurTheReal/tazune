@@ -5,17 +5,15 @@ const MAX_NAME_LEN: usize = 255; // wire format, including length bytes and the 
 const MAX_JUMPS: usize = 5;
 
 pub struct BytePacketBuffer {
-    pub buf: Vec<u8>,
-    pub pos: usize,
-    pub max_length: usize,
+    buf: Vec<u8>,
+    pos: usize,
 }
 
 impl BytePacketBuffer {
     pub fn new(max_len: usize) -> BytePacketBuffer {
         BytePacketBuffer {
-            buf: Vec::from_iter(std::iter::repeat(0).take(max_len)),
+            buf: vec![0; max_len],
             pos: 0,
-            max_length: max_len,
         }
     }
 
@@ -23,44 +21,59 @@ impl BytePacketBuffer {
         self.pos
     }
 
+    // Everything written to the buffer so far.
+    pub fn written(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+
+    // The whole underlying buffer
+    pub fn buf_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
     pub fn step(&mut self, steps: usize) -> Result<(), TazuneError> {
-        if self.pos + steps >= self.max_length {
-            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
+        if self.pos.saturating_add(steps) > self.buf.len() {
+            return Err(TazuneError::EndOfBufferReached {
+                buffer_length: self.buf.len(),
+            });
         }
         self.pos += steps;
         Ok(())
     }
 
     pub fn seek(&mut self, pos: usize) -> Result<(), TazuneError> {
-        if pos > self.max_length {
-            return Err(TazuneError::IndexOutOfRange { range_start: 0, range_end: self.max_length });
+        if pos > self.buf.len() {
+            return Err(TazuneError::IndexOutOfRange {
+                range_start: 0,
+                range_end: self.buf.len(),
+            });
         }
         self.pos = pos;
-        return Ok(());
+        Ok(())
     }
 
     pub fn read(&mut self) -> Result<u8, TazuneError> {
-        if self.pos >= 512 {
-            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
-        }
-        let res = self.buf[self.pos];
+        let res = self.get(self.pos)?;
         self.pos += 1;
 
         Ok(res)
     }
 
-    pub fn get(&mut self, pos: usize) -> Result<u8, TazuneError> {
-        if pos >= 512 {
-            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
-        }
-        Ok(self.buf[pos])
+    pub fn get(&self, pos: usize) -> Result<u8, TazuneError> {
+        self.buf
+            .get(pos)
+            .copied()
+            .ok_or(TazuneError::EndOfBufferReached {
+                buffer_length: self.buf.len(),
+            })
     }
 
-    pub fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8], TazuneError> {
-        if start + len >= 512 {
-            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
-        }
-        Ok(&self.buf[start..start + (len as usize)])
+    pub fn get_range(&self, start: usize, len: usize) -> Result<&[u8], TazuneError> {
+        self.buf
+            .get(start..start.saturating_add(len))
+            .ok_or(TazuneError::EndOfBufferReached {
+                buffer_length: self.buf.len(),
+            })
     }
 
     pub fn read_u16(&mut self) -> Result<u16, TazuneError> {
@@ -70,11 +83,10 @@ impl BytePacketBuffer {
     }
 
     pub fn read_u32(&mut self) -> Result<u32, TazuneError> {
-        let res =
-            ((self.read()? as u32) << 24) |
-            ((self.read()? as u32) << 16) |
-            ((self.read()? as u32) << 8) |
-            ((self.read()? as u32) << 0);
+        let res = ((self.read()? as u32) << 24)
+            | ((self.read()? as u32) << 16)
+            | ((self.read()? as u32) << 8)
+            | (self.read()? as u32);
 
         Ok(res)
     }
@@ -120,7 +132,10 @@ impl BytePacketBuffer {
 
                     wire_len += len + 1;
                     if wire_len > MAX_NAME_LEN {
-                        return Err(TazuneError::QNameTooLong {max_name_len: MAX_NAME_LEN, name_len: wire_len });
+                        return Err(TazuneError::QNameTooLong {
+                            max_name_len: MAX_NAME_LEN,
+                            name_len: wire_len,
+                        });
                     }
 
                     if !result.is_empty() {
@@ -144,7 +159,9 @@ impl BytePacketBuffer {
 
                 // 0x40 / 0x80 label types are reserved.
                 _ => {
-                    return Err(TazuneError::InvalidLabelType { label_type: len & 0xc0 });
+                    return Err(TazuneError::InvalidLabelType {
+                        label_type: len & 0xc0,
+                    });
                 }
             }
         }
@@ -153,33 +170,25 @@ impl BytePacketBuffer {
         Ok(result)
     }
 
-    pub fn write(&mut self, val: u8) -> Result<(), TazuneError> {
-        if self.pos >= 512 {
-            return Err(TazuneError::EndOfBufferReached { buffer_length: self.max_length });
-        }
-        self.buf[self.pos] = val;
-        self.pos += 1;
-        Ok(())
-    }
-
     pub fn write_u8(&mut self, val: u8) -> Result<(), TazuneError> {
-        self.write(val)?;
+        self.set(self.pos, val)?;
+        self.pos += 1;
 
         Ok(())
     }
 
     pub fn write_u16(&mut self, val: u16) -> Result<(), TazuneError> {
-        self.write((val >> 8) as u8)?;
-        self.write((val & 0xFF) as u8)?;
+        self.write_u8((val >> 8) as u8)?;
+        self.write_u8((val & 0xFF) as u8)?;
 
         Ok(())
     }
 
     pub fn write_u32(&mut self, val: u32) -> Result<(), TazuneError> {
-        self.write(((val >> 24) & 0xFF) as u8)?;
-        self.write(((val >> 16) & 0xFF) as u8)?;
-        self.write(((val >> 8) & 0xFF) as u8)?;
-        self.write(((val >> 0) & 0xFF) as u8)?;
+        self.write_u8(((val >> 24) & 0xFF) as u8)?;
+        self.write_u8(((val >> 16) & 0xFF) as u8)?;
+        self.write_u8(((val >> 8) & 0xFF) as u8)?;
+        self.write_u8((val & 0xFF) as u8)?;
 
         Ok(())
     }
@@ -187,6 +196,9 @@ impl BytePacketBuffer {
     pub fn write_qname(&mut self, qname: &str) -> Result<(), TazuneError> {
         for label in qname.split('.') {
             let len = label.len();
+            if len == 0 {
+                continue; // empty name or trailing dot, the root label is written below
+            }
             if len > 0x3f {
                 return Err(TazuneError::LabelTooLong { label_len: len });
             }
@@ -203,7 +215,12 @@ impl BytePacketBuffer {
     }
 
     pub fn set(&mut self, pos: usize, val: u8) -> Result<(), TazuneError> {
-        self.buf[pos] = val;
+        let buffer_length = self.buf.len();
+        let slot = self
+            .buf
+            .get_mut(pos)
+            .ok_or(TazuneError::EndOfBufferReached { buffer_length })?;
+        *slot = val;
 
         Ok(())
     }
