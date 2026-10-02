@@ -1,27 +1,40 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
-use crate::errors::TazuneError;
 use crate::byte_buffer::BytePacketBuffer;
-
+use crate::errors::TazuneError;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResultCode {
-    NOERROR = 0,
-    FORMERR = 1,
-    SERVFAIL = 2,
-    NXDOMAIN = 3,
-    NOTIMP = 4,
-    REFUSED = 5,
+    UNKNOWN(u8),
+    NOERROR,  // 0
+    FORMERR,  // 1
+    SERVFAIL, // 2
+    NXDOMAIN, // 3
+    NOTIMP,   // 4
+    REFUSED,  // 5
 }
 
 impl ResultCode {
+    pub fn to_num(&self) -> u8 {
+        match *self {
+            ResultCode::UNKNOWN(x) => x,
+            ResultCode::NOERROR => 0,
+            ResultCode::FORMERR => 1,
+            ResultCode::SERVFAIL => 2,
+            ResultCode::NXDOMAIN => 3,
+            ResultCode::NOTIMP => 4,
+            ResultCode::REFUSED => 5,
+        }
+    }
+
     pub fn from_num(num: u8) -> ResultCode {
         match num {
+            0 => ResultCode::NOERROR,
             1 => ResultCode::FORMERR,
             2 => ResultCode::SERVFAIL,
             3 => ResultCode::NXDOMAIN,
             4 => ResultCode::NOTIMP,
             5 => ResultCode::REFUSED,
-            0 | _ => ResultCode::NOERROR,
+            _ => ResultCode::UNKNOWN(num),
         }
     }
 }
@@ -59,7 +72,6 @@ impl QueryType {
         }
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub struct DnsHeader {
@@ -107,30 +119,33 @@ impl DnsHeader {
         }
     }
 
-    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), TazuneError> {
-        self.id = buffer.read_u16()?;
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsHeader, TazuneError> {
+        let id = buffer.read_u16()?;
 
         let flags = buffer.read_u16()?;
         let a = (flags >> 8) as u8;
         let b = (flags & 0xFF) as u8;
-        self.recursion_desired = (a & (1 << 0)) > 0;
-        self.truncated_message = (a & (1 << 1)) > 0;
-        self.authoritative_answer = (a & (1 << 2)) > 0;
-        self.opcode = (a >> 3) & 0x0F;
-        self.response = (a & (1 << 7)) > 0;
 
-        self.rescode = ResultCode::from_num(b & 0x0F);
-        self.checking_disabled = (b & (1 << 4)) > 0;
-        self.authed_data = (b & (1 << 5)) > 0;
-        self.z = (b & (1 << 6)) > 0;
-        self.recursion_available = (b & (1 << 7)) > 0;
+        Ok(DnsHeader {
+            id,
 
-        self.questions = buffer.read_u16()?;
-        self.answers = buffer.read_u16()?;
-        self.authoritative_entries = buffer.read_u16()?;
-        self.resource_entries = buffer.read_u16()?;
+            recursion_desired: (a & (1 << 0)) > 0,
+            truncated_message: (a & (1 << 1)) > 0,
+            authoritative_answer: (a & (1 << 2)) > 0,
+            opcode: (a >> 3) & 0x0F,
+            response: (a & (1 << 7)) > 0,
 
-        Ok(())
+            rescode: ResultCode::from_num(b & 0x0F),
+            checking_disabled: (b & (1 << 4)) > 0,
+            authed_data: (b & (1 << 5)) > 0,
+            z: (b & (1 << 6)) > 0,
+            recursion_available: (b & (1 << 7)) > 0,
+
+            questions: buffer.read_u16()?,
+            answers: buffer.read_u16()?,
+            authoritative_entries: buffer.read_u16()?,
+            resource_entries: buffer.read_u16()?,
+        })
     }
 
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<(), TazuneError> {
@@ -140,12 +155,12 @@ impl DnsHeader {
             (self.recursion_desired as u8)
                 | ((self.truncated_message as u8) << 1)
                 | ((self.authoritative_answer as u8) << 2)
-                | (self.opcode << 3)
+                | ((self.opcode & 0x0F) << 3)
                 | ((self.response as u8) << 7) as u8,
         )?;
 
         buffer.write_u8(
-            (self.rescode as u8)
+            (self.rescode.to_num())
                 | ((self.checking_disabled as u8) << 4)
                 | ((self.authed_data as u8) << 5)
                 | ((self.z as u8) << 6)
@@ -161,7 +176,6 @@ impl DnsHeader {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsQuestion {
     pub name: String,
@@ -170,18 +184,15 @@ pub struct DnsQuestion {
 
 impl DnsQuestion {
     pub fn new(name: String, qtype: QueryType) -> DnsQuestion {
-        DnsQuestion {
-            name: name,
-            qtype: qtype,
-        }
+        DnsQuestion { name, qtype }
     }
 
-    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), TazuneError> {
-        self.name = buffer.read_qname()?; // qname
-        self.qtype = QueryType::from_num(buffer.read_u16()?); // qtype
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsQuestion, TazuneError> {
+        let name = buffer.read_qname()?; // qname
+        let qtype = QueryType::from_num(buffer.read_u16()?); // qtype
         let _ = buffer.read_u16()?; // class
 
-        Ok(())
+        Ok(DnsQuestion { name, qtype })
     }
 
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<(), TazuneError> {
@@ -201,7 +212,7 @@ pub enum DnsRecord {
     UNKNOWN {
         domain: String,
         qtype: u16,
-        data_len: u16,
+        data: Vec<u8>,
         ttl: u32,
     }, // 0
     A {
@@ -232,94 +243,92 @@ pub enum DnsRecord {
     }, // 28
 }
 
+// Writes a u16 length placeholder, runs `f` to write the record data and then
+// patches the placeholder with the number of bytes `f` wrote.
+fn write_with_len(
+    buffer: &mut BytePacketBuffer,
+    f: impl FnOnce(&mut BytePacketBuffer) -> Result<(), TazuneError>,
+) -> Result<(), TazuneError> {
+    let pos = buffer.pos();
+    buffer.write_u16(0)?;
+
+    f(buffer)?;
+
+    let size = buffer.pos() - (pos + 2);
+    buffer.set_u16(pos, size as u16)
+}
+
 impl DnsRecord {
-     pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsRecord, TazuneError> {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsRecord, TazuneError> {
         let domain = buffer.read_qname()?;
 
         let qtype_num = buffer.read_u16()?;
         let qtype = QueryType::from_num(qtype_num);
         let _ = buffer.read_u16()?;
         let ttl = buffer.read_u32()?;
-        let data_len = buffer.read_u16()?;
+        let data_len = buffer.read_u16()? as usize;
+        let rdata_end = buffer.pos() + data_len;
 
-        match qtype {
+        let record = match qtype {
             QueryType::A => {
-                let raw_addr = buffer.read_u32()?;
-                let addr = Ipv4Addr::new(
-                    ((raw_addr >> 24) & 0xFF) as u8,
-                    ((raw_addr >> 16) & 0xFF) as u8,
-                    ((raw_addr >> 8) & 0xFF) as u8,
-                    ((raw_addr >> 0) & 0xFF) as u8,
-                );
+                let addr = Ipv4Addr::from(buffer.read_u32()?);
 
-                Ok(DnsRecord::A {
-                    domain: domain,
-                    addr: addr,
-                    ttl: ttl,
-                })
+                DnsRecord::A { domain, addr, ttl }
             }
             QueryType::AAAA => {
-                let raw_addr1 = buffer.read_u32()?;
-                let raw_addr2 = buffer.read_u32()?;
-                let raw_addr3 = buffer.read_u32()?;
-                let raw_addr4 = buffer.read_u32()?;
-                let addr = Ipv6Addr::new(
-                    ((raw_addr1 >> 16) & 0xFFFF) as u16,
-                    ((raw_addr1 >> 0) & 0xFFFF) as u16,
-                    ((raw_addr2 >> 16) & 0xFFFF) as u16,
-                    ((raw_addr2 >> 0) & 0xFFFF) as u16,
-                    ((raw_addr3 >> 16) & 0xFFFF) as u16,
-                    ((raw_addr3 >> 0) & 0xFFFF) as u16,
-                    ((raw_addr4 >> 16) & 0xFFFF) as u16,
-                    ((raw_addr4 >> 0) & 0xFFFF) as u16,
-                );
+                let mut octets = [0u8; 16];
+                for octet in octets.iter_mut() {
+                    *octet = buffer.read()?;
+                }
+                let addr = Ipv6Addr::from(octets);
 
-                Ok(DnsRecord::AAAA {
-                    domain: domain,
-                    addr: addr,
-                    ttl: ttl,
-                })
+                DnsRecord::AAAA { domain, addr, ttl }
             }
             QueryType::NS => {
                 let ns = buffer.read_qname()?;
 
-                Ok(DnsRecord::NS {
-                    domain: domain,
+                DnsRecord::NS {
+                    domain,
                     host: ns,
-                    ttl: ttl,
-                })
+                    ttl,
+                }
             }
             QueryType::CNAME => {
                 let cname = buffer.read_qname()?;
 
-                Ok(DnsRecord::CNAME {
-                    domain: domain,
+                DnsRecord::CNAME {
+                    domain,
                     host: cname,
-                    ttl: ttl,
-                })
+                    ttl,
+                }
             }
             QueryType::MX => {
                 let priority = buffer.read_u16()?;
                 let mx = buffer.read_qname()?;
 
-                Ok(DnsRecord::MX {
-                    domain: domain,
-                    priority: priority,
+                DnsRecord::MX {
+                    domain,
+                    priority,
                     host: mx,
-                    ttl: ttl,
-                })
+                    ttl,
+                }
             }
             QueryType::UNKNOWN(_) => {
-                buffer.step(data_len as usize)?;
+                let data = buffer.get_range(buffer.pos(), data_len)?.to_vec();
 
-                Ok(DnsRecord::UNKNOWN {
-                    domain: domain,
+                DnsRecord::UNKNOWN {
+                    domain,
                     qtype: qtype_num,
-                    data_len: data_len,
-                    ttl: ttl,
-                })
+                    data,
+                    ttl,
+                }
             }
-        }
+        };
+
+        // Always land exactly after the record, whatever the parsing above consumed.
+        buffer.seek(rdata_end)?;
+
+        Ok(record)
     }
 
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize, TazuneError> {
@@ -353,13 +362,7 @@ impl DnsRecord {
                 buffer.write_u16(1)?;
                 buffer.write_u32(ttl)?;
 
-                let pos = buffer.pos();
-                buffer.write_u16(0)?;
-
-                buffer.write_qname(host)?;
-
-                let size = buffer.pos() - (pos + 2);
-                buffer.set_u16(pos, size as u16)?;
+                write_with_len(buffer, |buffer| buffer.write_qname(host))?;
             }
             DnsRecord::CNAME {
                 ref domain,
@@ -371,13 +374,7 @@ impl DnsRecord {
                 buffer.write_u16(1)?;
                 buffer.write_u32(ttl)?;
 
-                let pos = buffer.pos();
-                buffer.write_u16(0)?;
-
-                buffer.write_qname(host)?;
-
-                let size = buffer.pos() - (pos + 2);
-                buffer.set_u16(pos, size as u16)?;
+                write_with_len(buffer, |buffer| buffer.write_qname(host))?;
             }
             DnsRecord::MX {
                 ref domain,
@@ -390,14 +387,10 @@ impl DnsRecord {
                 buffer.write_u16(1)?;
                 buffer.write_u32(ttl)?;
 
-                let pos = buffer.pos();
-                buffer.write_u16(0)?;
-
-                buffer.write_u16(priority)?;
-                buffer.write_qname(host)?;
-
-                let size = buffer.pos() - (pos + 2);
-                buffer.set_u16(pos, size as u16)?;
+                write_with_len(buffer, |buffer| {
+                    buffer.write_u16(priority)?;
+                    buffer.write_qname(host)
+                })?;
             }
             DnsRecord::AAAA {
                 ref domain,
@@ -414,8 +407,21 @@ impl DnsRecord {
                     buffer.write_u16(*octet)?;
                 }
             }
-            DnsRecord::UNKNOWN { .. } => {
-                println!("Skipping record: {:?}", self);
+            DnsRecord::UNKNOWN {
+                ref domain,
+                qtype,
+                ref data,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(qtype)?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(data.len() as u16)?;
+
+                for b in data {
+                    buffer.write_u8(*b)?;
+                }
             }
         }
 
@@ -445,11 +451,10 @@ impl DnsPacket {
 
     pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<DnsPacket, TazuneError> {
         let mut result = DnsPacket::new();
-        result.header.read(buffer)?;
+        result.header = DnsHeader::read(buffer)?;
 
         for _ in 0..result.header.questions {
-            let mut question = DnsQuestion::new("".to_string(), QueryType::UNKNOWN(0));
-            question.read(buffer)?;
+            let question = DnsQuestion::read(buffer)?;
             result.questions.push(question);
         }
 
@@ -468,7 +473,6 @@ impl DnsPacket {
 
         Ok(result)
     }
-
 
     pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), TazuneError> {
         self.header.questions = self.questions.len() as u16;
