@@ -4,7 +4,9 @@ use crate::errors::TazuneError;
 
 use log::{debug, error, info, warn};
 use std::io::{Read, Write};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -133,8 +135,42 @@ fn build_response(request: &DnsPacket, upstream_resolver: Addr) -> DnsPacket {
     response
 }
 
-pub fn proxy_server(upstream_resolver: Addr, listen_addr: Addr) -> Result<(), TazuneError> {
-    let socket = UdpSocket::bind(listen_addr)?;
+// Everything that happens after a request was received and parsed. This is the
+// slow part (it waits on the upstream resolver), so it runs on a worker thread.
+fn handle_request(
+    socket: &UdpSocket,
+    request: &DnsPacket,
+    src: SocketAddr,
+    upstream_resolver: Addr,
+    started: Instant,
+) {
+    let question = request
+        .questions
+        .first()
+        .map(|q| format!("{} {:?}", q.name, q.qtype))
+        .unwrap_or_else(|| "<no question>".to_string());
+    debug!("query from {src}: {question}");
+
+    let mut response = build_response(request, upstream_resolver);
+    let buffer = match serialize(&mut response) {
+        Ok(b) => b,
+        Err(e) => { error!("couldn't serialize response for {src}: {e}"); return; }
+    };
+
+    if let Err(e) = socket.send_to(buffer.written(), src) {
+        warn!("send to {src} failed: {e}");
+        return;
+    }
+
+    let rescode = response.header.rescode;
+    let answers = response.answers.len();
+    let elapsed = started.elapsed();
+    info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}");
+}
+
+// address of upstream resolver needs to be static because in most cases it will outlive the thread its in
+pub fn proxy_server(upstream_resolver: Addr<'static>, listen_addr: Addr) -> Result<(), TazuneError> {
+    let socket = Arc::new(UdpSocket::bind(listen_addr)?);
 
     info!(
         "listening on {}:{}, forwarding to {}:{}",
@@ -154,27 +190,15 @@ pub fn proxy_server(upstream_resolver: Addr, listen_addr: Addr) -> Result<(), Ta
             Err(e) => { warn!("bad packet from {src}: {e}"); continue; }
         };
 
-        let question = user_request_packet
-            .questions
-            .first()
-            .map(|q| format!("{} {:?}", q.name, q.qtype))
-            .unwrap_or_else(|| "<no question>".to_string());
-        debug!("query from {src}: {question}");
+        let worker_socket = Arc::clone(&socket);
+        let spawned = thread::Builder::new()
+            .name("worker".to_string())
+            .spawn(move || {
+                handle_request(&worker_socket, &user_request_packet, src, upstream_resolver, started);
+            });
 
-        let mut response = build_response(&user_request_packet, upstream_resolver);
-        let buffer = match serialize(&mut response) {
-            Ok(b) => b,
-            Err(e) => { error!("couldn't serialize response for {src}: {e}"); continue; }
-        };
-
-        if let Err(e) = socket.send_to(buffer.written(), src) {
-            warn!("send to {src} failed: {e}");
-            continue;
+        if let Err(e) = spawned {
+            error!("couldn't spawn a worker for {src}: {e}");
         }
-
-        let rescode = response.header.rescode;
-        let answers = response.answers.len();
-        let elapsed = started.elapsed();
-        info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}");
     }
 }
