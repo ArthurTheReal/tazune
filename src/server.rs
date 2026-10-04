@@ -5,13 +5,12 @@ use crate::errors::TazuneError;
 use log::{debug, error, info, warn};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-
-type Addr <'a> = (&'a str, u16);
 
 fn check_id(expected: u16, received: u16) -> Result<(), TazuneError> {
     if expected != received {
@@ -25,7 +24,7 @@ fn random_id() -> u16 {
     RandomState::new().build_hasher().finish() as u16
 }
 
-fn query_tcp(server: Addr, request: &[u8]) -> Result<BytePacketBuffer, TazuneError> {
+fn query_tcp(server: SocketAddr, request: &[u8]) -> Result<BytePacketBuffer, TazuneError> {
     let mut stream = TcpStream::connect(server)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
 
@@ -43,10 +42,12 @@ fn query_tcp(server: Addr, request: &[u8]) -> Result<BytePacketBuffer, TazuneErr
     Ok(buffer)
 }
 
-pub fn lookup(qname: String, qtype: QueryType, server: Addr) -> Result<DnsPacket, TazuneError> {
-    debug!("asking {}:{} for {qname} {qtype:?}", server.0, server.1);
+pub fn lookup(qname: String, qtype: QueryType, server: SocketAddr) -> Result<DnsPacket, TazuneError> {
+    debug!("asking {server} for {qname} {qtype:?}");
 
-    let socket = UdpSocket::bind(("0.0.0.0", 0))?;
+    // The local socket has to be the same address family as the upstream.
+    let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
 
     let mut packet = DnsPacket::new();
@@ -70,7 +71,7 @@ pub fn lookup(qname: String, qtype: QueryType, server: Addr) -> Result<DnsPacket
     check_id(packet.header.id, header.id)?;
 
     let res_packet = if header.truncated_message {
-        info!("response from {}:{} was truncated, retrying over TCP", server.0, server.1);
+        info!("response from {server} was truncated, retrying over TCP");
 
         let mut tcp_buffer = query_tcp(server, req_buffer.written())?;
         let tcp_packet = DnsPacket::from_buffer(&mut tcp_buffer)?;
@@ -83,11 +84,46 @@ pub fn lookup(qname: String, qtype: QueryType, server: Addr) -> Result<DnsPacket
     };
 
     debug!(
-        "{}:{} replied {:?} with {} answers",
-        server.0, server.1, res_packet.header.rescode, res_packet.answers.len()
+        "{server} replied {:?} with {} answers",
+        res_packet.header.rescode, res_packet.answers.len()
     );
 
     Ok(res_packet)
+}
+
+// the set of upstream resolvers. Queries are spread across them round-robin, and
+// if the chosen one fails the remaining ones are tried
+// in order before giving up. Shared between worker threads through an Arc.
+struct Upstreams {
+    resolvers: Vec<SocketAddr>,
+    next: AtomicUsize,
+}
+
+impl Upstreams {
+    fn new(resolvers: Vec<SocketAddr>) -> Upstreams {
+        Upstreams {
+            resolvers,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn lookup(&self, qname: &str, qtype: QueryType) -> Result<DnsPacket, TazuneError> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+
+        let mut last_err = None;
+        for i in 0..self.resolvers.len() {
+            let server = self.resolvers[start.wrapping_add(i) % self.resolvers.len()];
+            match lookup(qname.to_string(), qtype, server) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    warn!("upstream {server} failed for {qname}: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or(TazuneError::NoUpstreams))
+    }
 }
 
 fn serialize(response: &mut DnsPacket) -> Result<BytePacketBuffer, TazuneError> {
@@ -106,7 +142,7 @@ fn serialize(response: &mut DnsPacket) -> Result<BytePacketBuffer, TazuneError> 
     Ok(buffer)
 }
 
-fn build_response(request: &DnsPacket, upstream_resolver: Addr) -> DnsPacket {
+fn build_response(request: &DnsPacket, upstreams: &Upstreams) -> DnsPacket {
     let mut response = DnsPacket::new();
     response.header.id = request.header.id;
     response.header.response = true;
@@ -121,13 +157,13 @@ fn build_response(request: &DnsPacket, upstream_resolver: Addr) -> DnsPacket {
     }
 
     let question = &request.questions[0];
-    match lookup(question.name.clone(), question.qtype, upstream_resolver) {
+    match upstreams.lookup(&question.name, question.qtype) {
         Ok(upstream_response) => {
             response.header.rescode = upstream_response.header.rescode;
             response.answers = upstream_response.answers;
         }
         Err(e) => {
-            warn!("lookup of {} failed: {e}", question.name);
+            warn!("lookup of {} failed on every upstream: {e}", question.name);
             response.header.rescode = ResultCode::SERVFAIL;
         }
     }
@@ -136,12 +172,12 @@ fn build_response(request: &DnsPacket, upstream_resolver: Addr) -> DnsPacket {
 }
 
 // Everything that happens after a request was received and parsed. This is the
-// slow part (it waits on the upstream resolver), so it runs on a worker thread.
+// slow part (it waits on the upstream resolvers), so it runs on a worker thread.
 fn handle_request(
     socket: &UdpSocket,
     request: &DnsPacket,
     src: SocketAddr,
-    upstream_resolver: Addr,
+    upstreams: &Upstreams,
     started: Instant,
 ) {
     let question = request
@@ -151,7 +187,7 @@ fn handle_request(
         .unwrap_or_else(|| "<no question>".to_string());
     debug!("query from {src}: {question}");
 
-    let mut response = build_response(request, upstream_resolver);
+    let mut response = build_response(request, upstreams);
     let buffer = match serialize(&mut response) {
         Ok(b) => b,
         Err(e) => { error!("couldn't serialize response for {src}: {e}"); return; }
@@ -168,13 +204,20 @@ fn handle_request(
     info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}");
 }
 
-// address of upstream resolver needs to be static because in most cases it will outlive the thread its in
-pub fn proxy_server(upstream_resolver: Addr<'static>, listen_addr: Addr) -> Result<(), TazuneError> {
+pub fn proxy_server(upstream_resolvers: Vec<SocketAddr>, listen_addr: SocketAddr) -> Result<(), TazuneError> {
+    if upstream_resolvers.is_empty() {
+        return Err(TazuneError::NoUpstreams);
+    }
+
+    // Arc lets the main loop and every worker share one socket. recv_from and
+    // send_to both take &self, so no lock is needed.
     let socket = Arc::new(UdpSocket::bind(listen_addr)?);
+    let upstreams = Arc::new(Upstreams::new(upstream_resolvers));
 
     info!(
-        "listening on {}:{}, forwarding to {}:{}",
-        listen_addr.0, listen_addr.1, upstream_resolver.0, upstream_resolver.1
+        "listening on {listen_addr}, forwarding to {} upstream resolvers: {:?}",
+        upstreams.resolvers.len(),
+        upstreams.resolvers
     );
 
     loop {
@@ -191,12 +234,15 @@ pub fn proxy_server(upstream_resolver: Addr<'static>, listen_addr: Addr) -> Resu
         };
 
         let worker_socket = Arc::clone(&socket);
+        let worker_upstreams = Arc::clone(&upstreams);
         let spawned = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                handle_request(&worker_socket, &user_request_packet, src, upstream_resolver, started);
+                handle_request(&worker_socket, &user_request_packet, src, &worker_upstreams, started);
             });
 
+        // Unlike thread::spawn, Builder::spawn returns an error instead of
+        // panicking when the OS refuses to create a thread.
         if let Err(e) = spawned {
             error!("couldn't spawn a worker for {src}: {e}");
         }
