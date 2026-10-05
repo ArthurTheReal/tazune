@@ -1,18 +1,33 @@
 mod byte_buffer;
+mod config;
 mod dns;
 mod errors;
 mod server;
 
+use std::path::PathBuf;
+
+use config::Config;
 use errors::TazuneError;
-use server::{proxy_server};
+use log::{error, info};
 
+fn run() -> Result<(), TazuneError> {
+    let path = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-fn main() -> Result<(), TazuneError> {
-    let upstream_addr = ("8.8.8.8", 53);
-    let listen_addr = ("0.0.0.0", 10053);
+    let config = Config::load(&path)?;
+    info!("loaded config from {}", path.display());
 
+    server::proxy_server(config.upstreams, config.listen)
+}
+
+fn main() {
+    // log level comes from RUST_LOG env variable
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    proxy_server(upstream_addr, listen_addr)?;
-    Ok(())
+    if let Err(e) = run() {
+        error!("{e}");
+        std::process::exit(1);
+    }
 }

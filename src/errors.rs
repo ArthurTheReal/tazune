@@ -35,4 +35,19 @@ pub enum TazuneError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("couldn't read config file {path}: {source}")]
+    ConfigRead {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error("invalid config file {path}: {source}")]
+    ConfigParse {
+        path: String,
+        source: toml::de::Error,
+    },
+
+    #[error("no upstream resolvers configured, list at least one in `upstreams`")]
+    NoUpstreams,
 }

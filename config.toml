@@ -1,0 +1,11 @@
+# Address and port to listen on. Use 127.0.0.1 to serve only this machine,
+# or 0.0.0.0 to serve other devices on your network. (Port 53 needs root.)
+listen = "127.0.0.1:1053"
+
+# Upstream resolvers as IP:port. Queries are spread across them in turn, and if
+# one doesn't answer, the next one is tried.
+upstreams = [
+    "8.8.8.8:53",
+    "1.1.1.1:53",
+    "9.9.9.9:53",
+]

@@ -3,14 +3,14 @@ use crate::dns::{DnsHeader, DnsPacket, DnsQuestion, QueryType, ResultCode};
 use crate::errors::TazuneError;
 
 use log::{debug, error, info, warn};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn check_id(expected: u16, received: u16) -> Result<(), TazuneError> {
     if expected != received {
@@ -42,11 +42,19 @@ fn query_tcp(server: SocketAddr, request: &[u8]) -> Result<BytePacketBuffer, Taz
     Ok(buffer)
 }
 
-pub fn lookup(qname: String, qtype: QueryType, server: SocketAddr) -> Result<DnsPacket, TazuneError> {
+pub fn lookup(
+    qname: String,
+    qtype: QueryType,
+    server: SocketAddr,
+) -> Result<DnsPacket, TazuneError> {
     debug!("asking {server} for {qname} {qtype:?}");
 
     // The local socket has to be the same address family as the upstream.
-    let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
 
@@ -55,9 +63,7 @@ pub fn lookup(qname: String, qtype: QueryType, server: SocketAddr) -> Result<Dns
     packet.header.id = random_id();
     packet.header.questions = 1;
     packet.header.recursion_desired = true;
-    packet
-        .questions
-        .push(DnsQuestion::new(qname, qtype));
+    packet.questions.push(DnsQuestion::new(qname, qtype));
 
     let mut req_buffer = BytePacketBuffer::new(512);
     packet.write(&mut req_buffer)?;
@@ -85,7 +91,8 @@ pub fn lookup(qname: String, qtype: QueryType, server: SocketAddr) -> Result<Dns
 
     debug!(
         "{server} replied {:?} with {} answers",
-        res_packet.header.rescode, res_packet.answers.len()
+        res_packet.header.rescode,
+        res_packet.answers.len()
     );
 
     Ok(res_packet)
@@ -151,7 +158,10 @@ fn build_response(request: &DnsPacket, upstreams: &Upstreams) -> DnsPacket {
     response.questions = request.questions.clone();
 
     if request.questions.len() != 1 {
-        warn!("expected exactly one question, got {}", request.questions.len());
+        warn!(
+            "expected exactly one question, got {}",
+            request.questions.len()
+        );
         response.header.rescode = ResultCode::FORMERR;
         return response;
     }
@@ -190,7 +200,10 @@ fn handle_request(
     let mut response = build_response(request, upstreams);
     let buffer = match serialize(&mut response) {
         Ok(b) => b,
-        Err(e) => { error!("couldn't serialize response for {src}: {e}"); return; }
+        Err(e) => {
+            error!("couldn't serialize response for {src}: {e}");
+            return;
+        }
     };
 
     if let Err(e) = socket.send_to(buffer.written(), src) {
@@ -204,7 +217,10 @@ fn handle_request(
     info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}");
 }
 
-pub fn proxy_server(upstream_resolvers: Vec<SocketAddr>, listen_addr: SocketAddr) -> Result<(), TazuneError> {
+pub fn proxy_server(
+    upstream_resolvers: Vec<SocketAddr>,
+    listen_addr: SocketAddr,
+) -> Result<(), TazuneError> {
     if upstream_resolvers.is_empty() {
         return Err(TazuneError::NoUpstreams);
     }
@@ -224,13 +240,19 @@ pub fn proxy_server(upstream_resolvers: Vec<SocketAddr>, listen_addr: SocketAddr
         let mut user_request_buffer = BytePacketBuffer::new(512);
         let (_, src) = match socket.recv_from(user_request_buffer.buf_mut()) {
             Ok(x) => x,
-            Err(e) => { error!("recv failed: {e}"); continue; }
+            Err(e) => {
+                error!("recv failed: {e}");
+                continue;
+            }
         };
         let started = Instant::now();
 
         let user_request_packet = match DnsPacket::from_buffer(&mut user_request_buffer) {
             Ok(p) => p,
-            Err(e) => { warn!("bad packet from {src}: {e}"); continue; }
+            Err(e) => {
+                warn!("bad packet from {src}: {e}");
+                continue;
+            }
         };
 
         let worker_socket = Arc::clone(&socket);
@@ -238,7 +260,13 @@ pub fn proxy_server(upstream_resolvers: Vec<SocketAddr>, listen_addr: SocketAddr
         let spawned = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                handle_request(&worker_socket, &user_request_packet, src, &worker_upstreams, started);
+                handle_request(
+                    &worker_socket,
+                    &user_request_packet,
+                    src,
+                    &worker_upstreams,
+                    started,
+                );
             });
 
         // Unlike thread::spawn, Builder::spawn returns an error instead of
