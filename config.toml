@@ -9,3 +9,7 @@ upstreams = [
     "1.1.1.1:53",
     "9.9.9.9:53",
 ]
+
+# Most answers kept in the cache at once. When it is full, expired answers are
+# dropped first, then the ones closest to expiring. 0 turns caching off.
+cache_size = 10000

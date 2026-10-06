@@ -273,7 +273,11 @@ impl DnsRecord {
             QueryType::A => {
                 let addr = Ipv4Addr::from(buffer.read_u32()?);
 
-                DnsRecord::A { domain, addr, ttl }
+                DnsRecord::A {
+                    domain,
+                    addr,
+                    ttl,
+                }
             }
             QueryType::AAAA => {
                 let mut octets = [0u8; 16];
@@ -282,7 +286,11 @@ impl DnsRecord {
                 }
                 let addr = Ipv6Addr::from(octets);
 
-                DnsRecord::AAAA { domain, addr, ttl }
+                DnsRecord::AAAA {
+                    domain,
+                    addr,
+                    ttl,
+                }
             }
             QueryType::NS => {
                 let ns = buffer.read_qname()?;
@@ -329,6 +337,31 @@ impl DnsRecord {
         buffer.seek(rdata_end)?;
 
         Ok(record)
+    }
+
+    pub fn ttl(&self) -> u32 {
+        match *self {
+            DnsRecord::UNKNOWN { ttl, .. }
+            | DnsRecord::A { ttl, .. }
+            | DnsRecord::NS { ttl, .. }
+            | DnsRecord::CNAME { ttl, .. }
+            | DnsRecord::MX { ttl, .. }
+            | DnsRecord::AAAA { ttl, .. } => ttl,
+        }
+    }
+
+    // A copy of this record with a different TTL, used when serving cached records.
+    pub fn with_ttl(&self, new_ttl: u32) -> DnsRecord {
+        let mut record = self.clone();
+        match record {
+            DnsRecord::UNKNOWN { ref mut ttl, .. }
+            | DnsRecord::A { ref mut ttl, .. }
+            | DnsRecord::NS { ref mut ttl, .. }
+            | DnsRecord::CNAME { ref mut ttl, .. }
+            | DnsRecord::MX { ref mut ttl, .. }
+            | DnsRecord::AAAA { ref mut ttl, .. } => *ttl = new_ttl,
+        }
+        record
     }
 
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize, TazuneError> {

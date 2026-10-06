@@ -1,16 +1,17 @@
 use crate::byte_buffer::BytePacketBuffer;
+use crate::cache::Cache;
 use crate::dns::{DnsHeader, DnsPacket, DnsQuestion, QueryType, ResultCode};
 use crate::errors::TazuneError;
 
 use log::{debug, error, info, warn};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 fn check_id(expected: u16, received: u16) -> Result<(), TazuneError> {
     if expected != received {
@@ -42,19 +43,11 @@ fn query_tcp(server: SocketAddr, request: &[u8]) -> Result<BytePacketBuffer, Taz
     Ok(buffer)
 }
 
-pub fn lookup(
-    qname: String,
-    qtype: QueryType,
-    server: SocketAddr,
-) -> Result<DnsPacket, TazuneError> {
+pub fn lookup(qname: String, qtype: QueryType, server: SocketAddr) -> Result<DnsPacket, TazuneError> {
     debug!("asking {server} for {qname} {qtype:?}");
 
     // The local socket has to be the same address family as the upstream.
-    let bind_addr = if server.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
+    let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
 
@@ -63,7 +56,9 @@ pub fn lookup(
     packet.header.id = random_id();
     packet.header.questions = 1;
     packet.header.recursion_desired = true;
-    packet.questions.push(DnsQuestion::new(qname, qtype));
+    packet
+        .questions
+        .push(DnsQuestion::new(qname, qtype));
 
     let mut req_buffer = BytePacketBuffer::new(512);
     packet.write(&mut req_buffer)?;
@@ -91,15 +86,14 @@ pub fn lookup(
 
     debug!(
         "{server} replied {:?} with {} answers",
-        res_packet.header.rescode,
-        res_packet.answers.len()
+        res_packet.header.rescode, res_packet.answers.len()
     );
 
     Ok(res_packet)
 }
 
-// the set of upstream resolvers. Queries are spread across them round-robin, and
-// if the chosen one fails the remaining ones are tried
+// The set of upstream resolvers. Queries are spread across them round-robin, and
+// if the chosen one fails (timeout, bad reply, ...) the remaining ones are tried
 // in order before giving up. Shared between worker threads through an Arc.
 struct Upstreams {
     resolvers: Vec<SocketAddr>,
@@ -115,6 +109,8 @@ impl Upstreams {
     }
 
     fn lookup(&self, qname: &str, qtype: QueryType) -> Result<DnsPacket, TazuneError> {
+        // Relaxed is enough: we only need each caller to get a different number,
+        // not any ordering relative to other memory operations.
         let start = self.next.fetch_add(1, Ordering::Relaxed);
 
         let mut last_err = None;
@@ -149,7 +145,8 @@ fn serialize(response: &mut DnsPacket) -> Result<BytePacketBuffer, TazuneError> 
     Ok(buffer)
 }
 
-fn build_response(request: &DnsPacket, upstreams: &Upstreams) -> DnsPacket {
+// Returns the response, and whether it came from the cache.
+fn build_response(request: &DnsPacket, upstreams: &Upstreams, cache: &Cache) -> (DnsPacket, bool) {
     let mut response = DnsPacket::new();
     response.header.id = request.header.id;
     response.header.response = true;
@@ -158,17 +155,29 @@ fn build_response(request: &DnsPacket, upstreams: &Upstreams) -> DnsPacket {
     response.questions = request.questions.clone();
 
     if request.questions.len() != 1 {
-        warn!(
-            "expected exactly one question, got {}",
-            request.questions.len()
-        );
+        warn!("expected exactly one question, got {}", request.questions.len());
         response.header.rescode = ResultCode::FORMERR;
-        return response;
+        return (response, false);
     }
 
     let question = &request.questions[0];
+
+    if let Some(cached) = cache.get(&question.name, question.qtype) {
+        debug!("cache hit for {} {:?}", question.name, question.qtype);
+        response.header.rescode = cached.rescode;
+        response.answers = cached.answers;
+        return (response, true);
+    }
+    debug!("cache miss for {} {:?}", question.name, question.qtype);
+
     match upstreams.lookup(&question.name, question.qtype) {
         Ok(upstream_response) => {
+            cache.put(
+                &question.name,
+                question.qtype,
+                upstream_response.header.rescode,
+                &upstream_response.answers,
+            );
             response.header.rescode = upstream_response.header.rescode;
             response.answers = upstream_response.answers;
         }
@@ -178,7 +187,7 @@ fn build_response(request: &DnsPacket, upstreams: &Upstreams) -> DnsPacket {
         }
     }
 
-    response
+    (response, false)
 }
 
 // Everything that happens after a request was received and parsed. This is the
@@ -188,6 +197,7 @@ fn handle_request(
     request: &DnsPacket,
     src: SocketAddr,
     upstreams: &Upstreams,
+    cache: &Cache,
     started: Instant,
 ) {
     let question = request
@@ -197,13 +207,10 @@ fn handle_request(
         .unwrap_or_else(|| "<no question>".to_string());
     debug!("query from {src}: {question}");
 
-    let mut response = build_response(request, upstreams);
+    let (mut response, cached) = build_response(request, upstreams, cache);
     let buffer = match serialize(&mut response) {
         Ok(b) => b,
-        Err(e) => {
-            error!("couldn't serialize response for {src}: {e}");
-            return;
-        }
+        Err(e) => { error!("couldn't serialize response for {src}: {e}"); return; }
     };
 
     if let Err(e) = socket.send_to(buffer.written(), src) {
@@ -214,13 +221,11 @@ fn handle_request(
     let rescode = response.header.rescode;
     let answers = response.answers.len();
     let elapsed = started.elapsed();
-    info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}");
+    let source = if cached { " (cached)" } else { "" };
+    info!("{src} {question} -> {rescode:?}, {answers} answers, {elapsed:?}{source}");
 }
 
-pub fn proxy_server(
-    upstream_resolvers: Vec<SocketAddr>,
-    listen_addr: SocketAddr,
-) -> Result<(), TazuneError> {
+pub fn proxy_server(upstream_resolvers: Vec<SocketAddr>, listen_addr: SocketAddr, cache_size: usize) -> Result<(), TazuneError> {
     if upstream_resolvers.is_empty() {
         return Err(TazuneError::NoUpstreams);
     }
@@ -229,44 +234,39 @@ pub fn proxy_server(
     // send_to both take &self, so no lock is needed.
     let socket = Arc::new(UdpSocket::bind(listen_addr)?);
     let upstreams = Arc::new(Upstreams::new(upstream_resolvers));
+    let cache = Arc::new(Cache::new(cache_size));
 
     info!(
         "listening on {listen_addr}, forwarding to {} upstream resolvers: {:?}",
         upstreams.resolvers.len(),
         upstreams.resolvers
     );
+    if cache_size == 0 {
+        info!("caching is disabled");
+    } else {
+        info!("caching up to {cache_size} answers");
+    }
 
     loop {
         let mut user_request_buffer = BytePacketBuffer::new(512);
         let (_, src) = match socket.recv_from(user_request_buffer.buf_mut()) {
             Ok(x) => x,
-            Err(e) => {
-                error!("recv failed: {e}");
-                continue;
-            }
+            Err(e) => { error!("recv failed: {e}"); continue; }
         };
         let started = Instant::now();
 
         let user_request_packet = match DnsPacket::from_buffer(&mut user_request_buffer) {
             Ok(p) => p,
-            Err(e) => {
-                warn!("bad packet from {src}: {e}");
-                continue;
-            }
+            Err(e) => { warn!("bad packet from {src}: {e}"); continue; }
         };
 
         let worker_socket = Arc::clone(&socket);
         let worker_upstreams = Arc::clone(&upstreams);
+        let worker_cache = Arc::clone(&cache);
         let spawned = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                handle_request(
-                    &worker_socket,
-                    &user_request_packet,
-                    src,
-                    &worker_upstreams,
-                    started,
-                );
+                handle_request(&worker_socket, &user_request_packet, src, &worker_upstreams, &worker_cache, started);
             });
 
         // Unlike thread::spawn, Builder::spawn returns an error instead of

@@ -8,6 +8,10 @@ fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 1053))
 }
 
+fn default_cache_size() -> usize {
+    10_000
+}
+
 // Mirrors config.toml. Unknown keys are rejected so a typo like "upstream = [...]"
 // fails loudly instead of being silently ignored.
 #[derive(Debug, Deserialize)]
@@ -20,6 +24,10 @@ pub struct Config {
     /// Upstream resolvers, as IP:port. Queries are spread across them and a
     /// failing resolver is skipped in favour of the next one.
     pub upstreams: Vec<SocketAddr>,
+
+    /// Most answers kept in the cache at once. 0 turns caching off.
+    #[serde(default = "default_cache_size")]
+    pub cache_size: usize,
 }
 
 impl Config {

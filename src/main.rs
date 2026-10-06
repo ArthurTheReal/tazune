@@ -1,4 +1,5 @@
 mod byte_buffer;
+mod cache;
 mod config;
 mod dns;
 mod errors;
@@ -19,7 +20,7 @@ fn run() -> Result<(), TazuneError> {
     let config = Config::load(&path)?;
     info!("loaded config from {}", path.display());
 
-    server::proxy_server(config.upstreams, config.listen)
+    server::proxy_server(config.upstreams, config.listen, config.cache_size)
 }
 
 fn main() {
